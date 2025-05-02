@@ -1,0 +1,13 @@
+io/kpininja/connect/cassandra/CassandraWriter.class
+io/kpininja/connect/cassandra/CassandraSinkConnector.class
+io/kpininja/connect/cassandra/FieldsMetadata.class
+io/kpininja/connect/cassandra/FieldsMetadata$Builder.class
+io/kpininja/connect/cassandra/PreparedStatementBinder$1.class
+io/kpininja/connect/cassandra/CassandraSinkConfig.class
+io/kpininja/connect/cassandra/VersionUtil.class
+io/kpininja/connect/cassandra/TableMetadata$ColumnInfo.class
+io/kpininja/connect/cassandra/RecordValidator.class
+io/kpininja/connect/cassandra/BufferedRecords.class
+io/kpininja/connect/cassandra/TableMetadata.class
+io/kpininja/connect/cassandra/CassandraSinkTask.class
+io/kpininja/connect/cassandra/PreparedStatementBinder.class
