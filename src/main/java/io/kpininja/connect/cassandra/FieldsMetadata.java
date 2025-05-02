@@ -43,10 +43,18 @@ public class FieldsMetadata {
     
     public static class Builder {
         private final Map<String, Field> fieldsByName = new HashMap<>();
+        private final boolean validatePkFields;
         
         /**
          * Add fields from a Connect Schema
          */
+
+
+         public Builder(String insertMode) {
+            // Only validate PK fields for INSERT_IF_NOT_EXISTS mode
+            this.validatePkFields = CassandraSinkConfig.INSERT_MODE_INSERT_IF_NOT_EXISTS.equals(insertMode);
+        }
+
         public Builder addFields(Schema schema, TableMetadata tableMetadata) {
             if (schema.type() != Schema.Type.STRUCT) {
                 throw new ConnectException("Only Struct schemas are supported");
@@ -65,7 +73,8 @@ public class FieldsMetadata {
                 }
             }
             
-            // Check primary keys with direct lookup
+            // Check primary keys only if validation is required
+        if (validatePkFields) {
             for (String pkColumn : tableMetadata.getPrimaryKeyColumns()) {
                 boolean found = false;
                 for (String fieldName : fieldsByName.keySet()) {
@@ -78,9 +87,10 @@ public class FieldsMetadata {
                     throw new ConnectException("Schema is missing primary key column: " + pkColumn);
                 }
             }
-            
-            return this;
         }
+        
+        return this;
+    }
         
         /**
          * Build the FieldsMetadata

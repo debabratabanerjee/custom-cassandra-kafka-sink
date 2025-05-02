@@ -18,9 +18,12 @@ public class RecordValidator {
     private static final Logger log = LoggerFactory.getLogger(RecordValidator.class);
     
     private final TableMetadata tableMetadata;
+    private final boolean validatePkFields;
     
-    public RecordValidator(TableMetadata tableMetadata) {
+    public RecordValidator(TableMetadata tableMetadata, String insertMode) {
         this.tableMetadata = tableMetadata;
+        // Only validate PK fields for INSERT_IF_NOT_EXISTS mode
+        this.validatePkFields = CassandraSinkConfig.INSERT_MODE_INSERT_IF_NOT_EXISTS.equals(insertMode);
     }
     
     /**
@@ -46,21 +49,34 @@ public class RecordValidator {
         if (!(record.value() instanceof Struct)) {
             throw new DataException("Record value must be a Struct");
         }
+
+        // Skip PK validation if not required
+        if (!validatePkFields) {
+            return;
+        }
         
         Struct value = (Struct) record.value();
         
         // Check that all primary key columns exist in the record with non-null values
         List<String> pkColumns = tableMetadata.getPrimaryKeyColumns();
         for (String pkColumn : pkColumns) {
-            Field field = schema.field(pkColumn);
-            if (field == null) {
-                throw new DataException("Primary key column " + pkColumn + " missing from record schema");
-            }
-            
-            Object fieldValue = value.get(field);
-            if (fieldValue == null) {
-                throw new DataException("Primary key column " + pkColumn + " cannot be null");
+            // Try case-insensitive field lookup
+        Field field = null;
+        for (Field f : schema.fields()) {
+            if (f.name().equalsIgnoreCase(pkColumn)) {
+                field = f;
+                break;
             }
         }
+        
+        if (field == null) {
+            throw new DataException("Primary key column " + pkColumn + " missing from record schema");
+        }
+        
+        Object fieldValue = value.get(field);
+        if (fieldValue == null) {
+            throw new DataException("Primary key column " + pkColumn + " cannot be null");
+        }
     }
+}
 }

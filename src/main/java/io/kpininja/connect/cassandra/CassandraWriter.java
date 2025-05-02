@@ -1,13 +1,20 @@
 package io.kpininja.connect.cassandra;
 
 import com.datastax.driver.core.*;
+import com.datastax.driver.core.exceptions.NoHostAvailableException;
+import com.datastax.driver.core.exceptions.ReadTimeoutException;
+import com.datastax.driver.core.exceptions.WriteTimeoutException;
+import com.datastax.driver.core.exceptions.QueryExecutionException;
+import com.datastax.driver.core.exceptions.OperationTimedOutException;
 import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.errors.RetriableException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * CassandraWriter handles the connection to Cassandra and writes records
@@ -21,6 +28,7 @@ public class CassandraWriter implements AutoCloseable {
     private final ConsistencyLevel consistencyLevel;
     private final Map<String, PreparedStatement> preparedStatementCache;
     private final int ttlSeconds;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
     public CassandraWriter(CassandraSinkConfig config) {
         this.config = config;
@@ -54,6 +62,8 @@ public class CassandraWriter implements AutoCloseable {
      * Get table metadata for a given keyspace and table
      */
     public TableMetadata getTableMetadata(String keyspace, String tableName) {
+        assertNotClosed();
+        
         KeyspaceMetadata keyspaceMetadata = cluster.getMetadata().getKeyspace(keyspace);
         if (keyspaceMetadata == null) {
             throw new ConnectException("Keyspace " + keyspace + " does not exist");
@@ -75,34 +85,78 @@ public class CassandraWriter implements AutoCloseable {
             return;
         }
         
-        // Get or create prepared statement
-        PreparedStatement preparedStatement = getPreparedStatement(isInsertIfNotExists, tableName);
+        assertNotClosed();
         
-        // Create batch statement if we have multiple records
-        if (parametersList.size() > 1) {
-            BatchStatement batchStatement = new BatchStatement(BatchStatement.Type.UNLOGGED);
-            batchStatement.setConsistencyLevel(consistencyLevel);
+        try {
+            // Get or create prepared statement
+            PreparedStatement preparedStatement = getPreparedStatement(isInsertIfNotExists, tableName);
             
-            for (Object[] parameters : parametersList) {
-                BoundStatement boundStatement = preparedStatement.bind(parameters);
-                batchStatement.add(boundStatement);
+            // Create batch statement if we have multiple records
+            if (parametersList.size() > 1 && !isInsertIfNotExists) {
+                BatchStatement batchStatement = new BatchStatement(BatchStatement.Type.UNLOGGED);
+                batchStatement.setConsistencyLevel(consistencyLevel);
+                
+                for (Object[] parameters : parametersList) {
+                    BoundStatement boundStatement = preparedStatement.bind(parameters);
+                    batchStatement.add(boundStatement);
+                }
+                
+                try {
+                    session.execute(batchStatement);
+                } catch (Exception e) {
+                    throw new ConnectException("Error executing batch statement", e);
+                }
+            } else {
+                // Single record or conditional writes, execute directly
+                for (Object[] parameters : parametersList) {
+                    BoundStatement boundStatement = preparedStatement.bind(parameters);
+                    boundStatement.setConsistencyLevel(consistencyLevel);
+                    
+                    try {
+                        session.execute(boundStatement);
+                    } catch (Exception e) {
+                        throw new ConnectException("Error executing statement", e);
+                    }
+                }
             }
-            
-            try {
-                session.execute(batchStatement);
-            } catch (Exception e) {
-                throw new ConnectException("Error executing batch statement", e);
+        } catch (Exception e) {
+            // Handle different types of exceptions
+            if (isRetriableError(e)) {
+                throw new RetriableException("Retriable error writing to Cassandra", e);
+            } else {
+                throw new ConnectException("Error writing to Cassandra", e);
             }
-        } else {
-            // Single record, execute directly
-            BoundStatement boundStatement = preparedStatement.bind(parametersList.get(0));
-            boundStatement.setConsistencyLevel(consistencyLevel);
-            
-            try {
-                session.execute(boundStatement);
-            } catch (Exception e) {
-                throw new ConnectException("Error executing statement", e);
-            }
+        }
+    }
+    
+    // Helper to check for retriable errors
+    private boolean isRetriableError(Exception e) {
+        if (e instanceof NoHostAvailableException || 
+            e instanceof QueryExecutionException || 
+            e instanceof OperationTimedOutException ||
+            e instanceof ReadTimeoutException || 
+            e instanceof WriteTimeoutException) {
+            return true;
+        }
+        
+        String message = e.getMessage();
+        if (message == null) {
+            return false;
+        }
+        
+        return message.contains("Operation timed out") ||
+               message.contains("Connection reset") ||
+               message.contains("Connection refused") ||
+               message.contains("No host available") ||
+               message.contains("Transport failure") ||
+               message.contains("Timeout during") ||
+               message.contains("Unavailable exception");
+    }
+    
+    // Check if connection is closed
+    private void assertNotClosed() {
+        if (closed.get()) {
+            throw new ConnectException("CassandraWriter has been closed");
         }
     }
 
@@ -181,12 +235,12 @@ public class CassandraWriter implements AutoCloseable {
     }
 
     private String getCacheKey(boolean isInsertIfNotExists, String tableName) {
-    return String.format("%s.%s-%s-%d", 
-            config.getKeyspace(), 
-            tableName, 
-            isInsertIfNotExists ? "if_not_exists" : "normal", 
-            ttlSeconds);
-}
+        return String.format("%s.%s-%s-%d", 
+                config.getKeyspace(), 
+                tableName, 
+                isInsertIfNotExists ? "if_not_exists" : "normal", 
+                ttlSeconds);
+    }
 
     private String[] parseContactPoints(String connectionUrl) {
         // Simple parsing of connection URL
@@ -215,6 +269,7 @@ public class CassandraWriter implements AutoCloseable {
                 port = Integer.parseInt(connectionUrl.substring(portIndex + 1));
             } catch (NumberFormatException e) {
                 // Use default port
+                log.warn("Invalid port in connection URL, using default port 9042");
             }
         }
         
@@ -231,20 +286,32 @@ public class CassandraWriter implements AutoCloseable {
 
     @Override
     public void close() {
+        if (!closed.compareAndSet(false, true)) {
+            log.debug("CassandraWriter already closed");
+            return;
+        }
+        
+        log.info("Closing Cassandra writer resources");
+        
         if (session != null) {
             try {
                 session.close();
+                log.debug("Cassandra session closed");
             } catch (Exception e) {
-                log.warn("Error closing session", e);
+                log.warn("Error closing session: {}", e.getMessage());
             }
         }
         
         if (cluster != null) {
             try {
                 cluster.close();
+                log.debug("Cassandra cluster connection closed");
             } catch (Exception e) {
-                log.warn("Error closing cluster", e);
+                log.warn("Error closing cluster: {}", e.getMessage());
             }
         }
+        
+        preparedStatementCache.clear();
+        log.info("CassandraWriter resources closed");
     }
 }

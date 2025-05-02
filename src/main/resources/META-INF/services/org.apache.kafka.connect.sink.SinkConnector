@@ -1,1 +1,1 @@
-com.example.kafka.connect.cassandra.CustomCassandraSinkConnector
+io.kpininja.connect.cassandra.CassandraSinkConnector
